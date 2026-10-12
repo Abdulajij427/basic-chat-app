@@ -1,48 +1,70 @@
-import {WebSocketServer , WebSocket} from  'ws';
+import { WebSocketServer, WebSocket } from "ws";
 
-const wss = new WebSocketServer({port:8080});
+type ClientMessage =
+  | { type: "join"; payload: { roomId: string } }
+  | { type: "chat"; payload: { message: string } };
+type ServerMessage =
+  | { type: "chat"; payload: { id: string; message: string; sentAt: string } }
+  | { type: "presence"; payload: { count: number } }
+  | { type: "error"; payload: { message: string } };
 
+const MAX_MESSAGE_LENGTH = 2_000;
+const rooms = new Map<string, Set<WebSocket>>();
+const socketRooms = new WeakMap<WebSocket, string>();
+const wss = new WebSocketServer({ port: Number(process.env.PORT ?? 8080) });
 
-interface User {
-    socket: WebSocket;
-    room: string;
+function send(socket: WebSocket, message: ServerMessage) {
+  if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+}
+function broadcastPresence(roomId: string) {
+  const clients = rooms.get(roomId);
+  if (!clients) return;
+  const message: ServerMessage = { type: "presence", payload: { count: clients.size } };
+  clients.forEach((client) => send(client, message));
+}
+function leaveRoom(socket: WebSocket) {
+  const roomId = socketRooms.get(socket);
+  if (!roomId) return;
+  const clients = rooms.get(roomId);
+  clients?.delete(socket);
+  socketRooms.delete(socket);
+  if (!clients?.size) rooms.delete(roomId);
+  else broadcastPresence(roomId);
+}
+function joinRoom(socket: WebSocket, roomId: string) {
+  leaveRoom(socket);
+  const clients = rooms.get(roomId) ?? new Set<WebSocket>();
+  clients.add(socket);
+  rooms.set(roomId, clients);
+  socketRooms.set(socket, roomId);
+  broadcastPresence(roomId);
+}
+function parseMessage(raw: WebSocket.RawData): ClientMessage | null {
+  try { return JSON.parse(raw.toString()) as ClientMessage; } catch { return null; }
 }
 
+wss.on("connection", (socket) => {
+  socket.on("message", (raw) => {
+    const message = parseMessage(raw);
+    if (!message) return send(socket, { type: "error", payload: { message: "Invalid message format." } });
+    if (message.type === "join") {
+      const roomId = message.payload?.roomId?.trim().slice(0, 64);
+      if (!roomId) return send(socket, { type: "error", payload: { message: "A valid room is required." } });
+      return joinRoom(socket, roomId);
+    }
+    if (message.type === "chat") {
+      const roomId = socketRooms.get(socket);
+      const text = message.payload?.message?.trim();
+      if (!roomId) return send(socket, { type: "error", payload: { message: "Join a room before sending a message." } });
+      if (!text || text.length > MAX_MESSAGE_LENGTH) return send(socket, { type: "error", payload: { message: `Messages must be 1–${MAX_MESSAGE_LENGTH} characters.` } });
+      const outgoing: ServerMessage = { type: "chat", payload: { id: crypto.randomUUID(), message: text, sentAt: new Date().toISOString() } };
+      rooms.get(roomId)?.forEach((client) => send(client, outgoing));
+    }
+  });
+  socket.on("close", () => leaveRoom(socket));
+  socket.on("error", () => leaveRoom(socket));
+});
 
-let userCount = 0;
-let allSockets: User[] = [];
-
-wss.on("connection", (socket)=>{
-
-    
-    socket.on("message", (message)=>{
-        console.log("server is started");
-        const parsedMessage = JSON.parse(message as unknown as string);
-    
-        if(parsedMessage.type == "join"){
-            allSockets.push({
-                socket,
-                room: parsedMessage.payload.roomId
-            })
-        }
-
-        if(parsedMessage.type == "chat"){
-            let currentUserRoom = null;
-
-            for(const user of allSockets){
-                if(user.socket == socket){
-                    currentUserRoom = user.room;
-                }
-            }
-
-            for(const user of allSockets){
-                if(user.room == currentUserRoom){
-                    user.socket.send(parsedMessage.payload.message);
-                }
-            }
-        } 
-    })
- 
-})
+wss.on("listening", () => console.log("WebSocket server listening on port 8080"));
 
 
